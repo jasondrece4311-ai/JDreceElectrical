@@ -27,7 +27,7 @@ jobs:
     - name: Bypass Missing Google Services File
       run: |
         mkdir -p app
-        echo '{"project_info":{"project_number":"123","project_id":"dummy"},"client":[{"client_info":{"mobilesdk_app_id":"1:123:android:123","android_client_info":{"package_name":"com.example"}},"api_key":[{"current_key":"dummy"}]}]}' > app/google-services.json
+        echo '{"project_info":{"project_number":"123","project_id":"dummy"},"client":[{"client_info":{"mobilesdk_app_id":"1:123:android:123","android_client_info":{"package_name":"com.aistudio.pricetag.vkrxyp"}},"api_key":[{"current_key":"dummy"}]}]}' > app/google-services.json
 
     - name: Force Generate Local Project Keystore
       run: |
