@@ -3,39 +3,48 @@ package com.example
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.animation.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.ai.GeminiCircuitDiagnostician
-import com.example.engine.CircuitSolver
-import com.example.engine.GenSizerUtility
-import com.example.model.*
-import com.example.ui.*
-import com.example.ui.theme.*
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+
+// Data model to track draggable component items on the screen safely
+data class PlacedComponent(
+    val id: String,
+    val name: String,
+    var position: Offset
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
         setContent {
-            MyApplicationTheme {
-                CircuitStudioApp()
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .systemBarsPadding(), // FIX 1: Pushes content down below system clock/corners
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    MainSimulationScreen()
+                }
             }
         }
     }
@@ -43,362 +52,139 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CircuitStudioApp() {
-    val coroutineScope = rememberCoroutineScope()
+fun MainSimulationScreen() {
+    var isSimulating by remember { mutableStateOf(false) }
+    val componentCatalog = listOf("Line (L1)", "Neutral (N)", "Generator", "Breaker 3P", "Fuse", "Pushbutton NO", "Contactor", "3Φ Motor")
+    
+    // Track active movable components placed on the circuit board grid
+    val placedComponents = remember { mutableStateListOf<PlacedComponent>() }
+    var nextId by remember { mutableStateOf(1) }
 
-    // 1. Core State
-    val defaultTemplate = remember { WiringTemplates.getTemplates().first() }
-    var elements: List<CircuitElement> by remember { mutableStateOf(defaultTemplate.elements) }
-    var wires: List<Wire> by remember { mutableStateOf(defaultTemplate.wires) }
-
-    var isRunning by remember { mutableStateOf(true) }
-    var activeFaults by remember { mutableStateOf<List<CircuitFault>>(emptyList()) }
-    var totalGenKva by remember { mutableStateOf(0f) }
-    var genLoadPercent by remember { mutableStateOf(0f) }
-
-    // Selected Element for Radial Menu & Configuration
-    var selectedElementId by remember { mutableStateOf<String?>(null) }
-    val selectedElement = elements.firstOrNull { it.id == selectedElementId }
-
-    // Dialog & Drawer Visibility State
-    var showBottomCatalog by remember { mutableStateOf(false) }
-    var showGenSizerDialog by remember { mutableStateOf(false) }
-    var showFaultsAiDialog by remember { mutableStateOf(false) }
-    var editingElement by remember { mutableStateOf<CircuitElement?>(null) }
-    var showClearConfirmDialog by remember { mutableStateOf(false) }
-
-    // AI State
-    var aiDiagnosticReport by remember { mutableStateOf<GeminiCircuitDiagnostician.DiagnosticReport?>(null) }
-    var isLoadingAi by remember { mutableStateOf(false) }
-
-    // 2. Simulation Loop (Boolean Continuity & Load Physics Solver)
-    LaunchedEffect(isRunning, elements, wires) {
-        while (isRunning) {
-            val result = CircuitSolver.solve(elements, wires, deltaTimeMs = 100L)
-            elements = result.updatedElements
-            wires = result.updatedWires
-            activeFaults = result.activeFaults
-            totalGenKva = result.totalGenKva
-            genLoadPercent = result.genLoadPercent
-            delay(100L)
-        }
-    }
-
-    // 3. User Interaction Handlers
-    fun toggleElementState(target: CircuitElement) {
-        elements = elements.map { elem ->
-            if (elem.id == target.id) {
-                when (elem.type) {
-                    ComponentType.BREAKER_1P, ComponentType.BREAKER_3P -> {
-                        if (elem.isTripped) {
-                            elem.copy(isTripped = false, isClosed = true)
-                        } else {
-                            elem.copy(isClosed = !elem.isClosed)
-                        }
-                    }
-                    ComponentType.FUSE -> {
-                        if (elem.isBlown) {
-                            elem.copy(isBlown = false) // Replace blown fuse
-                        } else elem
-                    }
-                    ComponentType.ESTOP -> {
-                        elem.copy(isLatched = !elem.isLatched) // Latch or Twist-to-Reset
-                    }
-                    ComponentType.PUSHBUTTON_NO -> {
-                        elem.copy(isPressed = !elem.isPressed)
-                    }
-                    ComponentType.PUSHBUTTON_NC -> {
-                        elem.copy(isPressed = !elem.isPressed)
-                    }
-                    ComponentType.SELECTOR_2POS -> {
-                        elem.copy(selectorPosition = if (elem.selectorPosition == 0) 1 else 0)
-                    }
-                    ComponentType.SELECTOR_3POS -> {
-                        elem.copy(selectorPosition = (elem.selectorPosition + 1) % 3)
-                    }
-                    ComponentType.THERMAL_OVERLOAD -> {
-                        if (elem.isTripped) {
-                            elem.copy(isTripped = false)
-                        } else {
-                            elem.copy(isTripped = true) // Test trip
-                        }
-                    }
-                    ComponentType.GENERATOR -> {
-                        if (elem.isGenStalled) {
-                            elem.copy(isGenStalled = false, isGenRunning = true)
-                        } else {
-                            elem.copy(isGenRunning = !elem.isGenRunning)
-                        }
-                    }
-                    ComponentType.SENSOR_LIMIT, ComponentType.SENSOR_PROXIMITY,
-                    ComponentType.SENSOR_PHOTOELECTRIC, ComponentType.SENSOR_FLOAT,
-                    ComponentType.SENSOR_PRESSURE -> {
-                        elem.copy(isSensorTriggered = !elem.isSensorTriggered)
-                    }
-                    else -> elem
-                }
-            } else elem
-        }
-    }
-
-    fun deleteElement(target: CircuitElement) {
-        elements = elements.filterNot { it.id == target.id }
-        wires = wires.filterNot { it.fromElementId == target.id || it.toElementId == target.id }
-        selectedElementId = null
-    }
-
-    fun rotateElement(target: CircuitElement) {
-        elements = elements.map { elem ->
-            if (elem.id == target.id) {
-                elem.copy(rotation = (elem.rotation + 90) % 360)
-            } else elem
-        }
-    }
-
-    fun autoCleanLayout() {
-        // Automatically arranges components into neat ladder diagram standard columns & rows
-        val spacingY = 120f
-        var currentY = 50f
-
-        val power = elements.filter { it.type.category == ComponentCategory.POWER }
-        val protection = elements.filter { it.type.category == ComponentCategory.PROTECT }
-        val logic = elements.filter { it.type.category == ComponentCategory.LOGIC }
-        val sensors = elements.filter { it.type.category == ComponentCategory.SENSORS }
-        val outputs = elements.filter { it.type.category == ComponentCategory.OUTPUTS }
-        val meters = elements.filter { it.type.category == ComponentCategory.METERS }
-
-        val newPositions = mutableMapOf<String, Pair<Float, Float>>()
-
-        fun placeRow(rowElements: List<CircuitElement>, y: Float) {
-            var currentX = 60f
-            for (e in rowElements) {
-                newPositions[e.id] = Pair(currentX, y)
-                currentX += e.width + 40f
-            }
-        }
-
-        placeRow(power, currentY)
-        currentY += spacingY
-        placeRow(protection, currentY)
-        currentY += spacingY
-        placeRow(logic + sensors, currentY)
-        currentY += spacingY
-        placeRow(outputs, currentY)
-        currentY += spacingY
-        placeRow(meters, currentY)
-
-        elements = elements.map { e ->
-            val pos = newPositions[e.id]
-            if (pos != null) e.copy(x = pos.first, y = pos.second) else e
-        }
-    }
-
-    fun addWireBetween(fromElemId: String, fromTermId: String, toElemId: String, toTermId: String) {
-        val newWire = Wire(
-            id = "w_${System.currentTimeMillis()}",
-            fromElementId = fromElemId,
-            fromTerminalId = fromTermId,
-            toElementId = toElemId,
-            toTerminalId = toTermId
-        )
-        wires = wires + newWire
-    }
-
-    // 4. Mobile Scaffold Layout
     Scaffold(
-        modifier = Modifier
-            .fillMaxSize()
-            .navigationBarsPadding(),
         topBar = {
-            TopBarControls(
-                isRunning = isRunning,
-                onToggleRunStop = { isRunning = !isRunning },
-                onClear = { showClearConfirmDialog = true },
-                onAutoCleanLayout = { autoCleanLayout() },
-                onOpenGenSizer = { showGenSizerDialog = true },
-                activeFaultCount = activeFaults.size
+            TopAppBar(
+                title = { Text("Electrical Sim", fontSize = 16.sp) },
+                actions = {
+                    IconButton(onClick = { placedComponents.clear() }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Clear")
+                    }
+                    TextButton(onClick = { /* Open Gen sizing */ }) {
+                        Text("GEN SIZE", color = Color.Cyan, fontSize = 14.sp)
+                    }
+                    Button(
+                        onClick = { isSimulating = !isSimulating },
+                        colors = ButtonDefaults.buttonColors(containerColor = if (isSimulating) Color.Red else Color.Green),
+                        modifier = Modifier.padding(end = 4.dp)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = "Run", modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(2.dp))
+                        Text(if (isSimulating) "STOP" else "RUN", fontSize = 12.sp)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             )
         },
         floatingActionButton = {
-            Column(
-                horizontalAlignment = Alignment.End,
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+            FloatingActionButton(
+                onClick = { /* AI Diagnosis */ },
+                containerColor = Color(0xFF6200EE),
+                contentColor = Color.White
             ) {
-                // Floating Component Library Trigger
-                FloatingActionButton(
-                    onClick = { showBottomCatalog = true },
-                    containerColor = CadSurfaceVariant,
-                    contentColor = ElectricCyan,
-                    modifier = Modifier.testTag("open_catalog_fab")
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = "Add Component")
+                Row(modifier = Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Build, contentDescription = "AI")
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Ask AI", fontSize = 12.sp)
                 }
-
-                // Floating [💡 Ask AI] FAB with Fault Badge
-                BadgedBox(
-                    badge = {
-                        if (activeFaults.isNotEmpty()) {
-                            Badge(
-                                containerColor = IndustrialStopRed,
-                                contentColor = Color.White
+            }
+        },
+        bottomBar = {
+            BottomAppBar(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                contentPadding = PaddingValues(4.dp),
+                modifier = Modifier.height(90.dp)
+            ) {
+                Column {
+                    Text("Catalog (Tap to Add)", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 4.dp))
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                    ) {
+                        items(componentCatalog) { type ->
+                            Card(
+                                onClick = { 
+                                    // Add item dynamically to the center of the viewport screen view
+                                    placedComponents.add(PlacedComponent("id_$nextId", type, Offset(200f, 400f)))
+                                    nextId++
+                                },
+                                shape = RoundedCornerShape(6.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
                             ) {
-                                Text("${activeFaults.size}")
+                                Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                    Text(type, fontSize = 12.sp)
+                                }
                             }
                         }
                     }
-                ) {
-                    ExtendedFloatingActionButton(
-                        onClick = {
-                            showFaultsAiDialog = true
-                        },
-                        containerColor = if (activeFaults.isNotEmpty()) IndustrialStopRed else AiGemini,
-                        contentColor = Color.White,
-                        icon = {
-                            Icon(
-                                imageVector = if (activeFaults.isNotEmpty()) Icons.Default.Warning else Icons.Default.AutoAwesome,
-                                contentDescription = "Ask AI"
-                            )
-                        },
-                        text = {
-                            Text(
-                                text = if (activeFaults.isNotEmpty()) "Faults (${activeFaults.size})" else "Ask AI",
-                                fontWeight = FontWeight.Bold
-                            )
-                        },
-                        modifier = Modifier.testTag("ask_ai_fab")
-                    )
                 }
             }
         }
     ) { innerPadding ->
         Box(
             modifier = Modifier
-                .fillMaxSize()
                 .padding(innerPadding)
+                .fillMaxSize()
+                .background(Color(0xFF121212))
         ) {
-            // Interactive Electrical CAD Canvas
-            CircuitCanvasView(
-                elements = elements,
-                wires = wires,
-                selectedElementId = selectedElementId,
-                onSelectElement = { elem -> selectedElementId = elem?.id },
-                onToggleElement = { elem -> toggleElementState(elem) },
-                onMoveElement = { id, dx, dy ->
-                    elements = elements.map {
-                        if (it.id == id) it.copy(x = it.x + dx, y = it.y + dy) else it
-                    }
-                },
-                onAddWire = { fE, fT, tE, tT -> addWireBetween(fE, fT, tE, tT) }
+            // FIX 2: Custom grid layer that handles finger drag touch inputs cleanly
+            InteractiveGridCanvas(
+                components = placedComponents,
+                onComponentMoved = { index, newOffset ->
+                    placedComponents[index] = placedComponents[index].copy(position = newOffset)
+                }
             )
+        }
+    }
+}
 
-            // Canvas Element Radial Menu (Delete, Rotate, Toggle, Configure)
-            if (selectedElement != null) {
-                RadialMenu(
-                    element = selectedElement,
-                    canvasScale = 1.0f,
-                    canvasPanX = 0f,
-                    canvasPanY = 0f,
-                    onDelete = { deleteElement(it) },
-                    onRotate = { rotateElement(it) },
-                    onToggle = { toggleElementState(it) },
-                    onEditProperties = { editingElement = it },
-                    onDismiss = { selectedElementId = null }
-                )
+@Composable
+fun InteractiveGridCanvas(
+    components: List<PlacedComponent>,
+    onComponentMoved: (Int, Offset) -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Draw Blueprint Grid Layout Background lines
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val gridSpacing = 60f
+            for (x in 0..size.width.toInt() step gridSpacing.toInt()) {
+                drawLine(Color(0xFF222222), Offset(x.toFloat(), 0f), Offset(x.toFloat(), size.height), 1f)
             }
-
-            // Bottom Drawer: Component Library Catalog & Wiring Templates
-            if (showBottomCatalog) {
-                BottomDrawerCatalog(
-                    onSelectComponent = { compType ->
-                        val newElem = ComponentFactory.createComponent(
-                            type = compType,
-                            x = 150f + (elements.size % 4) * 30f,
-                            y = 150f + (elements.size % 4) * 30f
-                        )
-                        elements = elements + newElem
-                    },
-                    onSelectTemplate = { template ->
-                        elements = template.elements
-                        wires = template.wires
-                        selectedElementId = null
-                    },
-                    onDismiss = { showBottomCatalog = false }
-                )
+            for (y in 0..size.height.toInt() step gridSpacing.toInt()) {
+                drawLine(Color(0xFF222222), Offset(0f, y.toFloat()), Offset(size.width, y.toFloat()), 1f)
             }
+        }
 
-            // Generator Sizer Dialog
-            if (showGenSizerDialog) {
-                val sizerReport = remember(elements) {
-                    GenSizerUtility.calculateSizing(elements)
-                }
-                GenSizerDialog(
-                    report = sizerReport,
-                    onDismiss = { showGenSizerDialog = false }
-                )
-            }
-
-            // Fault Diagnostics & Gemini AI Modal
-            if (showFaultsAiDialog) {
-                val jsonSchema = remember(elements, wires, activeFaults, totalGenKva) {
-                    GeminiCircuitDiagnostician.serializeCanvasToJson(elements, wires, activeFaults, totalGenKva)
-                }
-                FaultDiagnosticDialog(
-                    activeFaults = activeFaults,
-                    jsonSchemaText = jsonSchema,
-                    report = aiDiagnosticReport,
-                    isLoadingAi = isLoadingAi,
-                    onRunAiDiagnosis = {
-                        coroutineScope.launch {
-                            isLoadingAi = true
-                            aiDiagnosticReport = GeminiCircuitDiagnostician.diagnose(
-                                elements, wires, activeFaults, totalGenKva
+        // Render each component box dynamically onto the board
+        components.forEachIndexed { index, component ->
+            Box(
+                modifier = Modifier
+                    .offset(
+                        x = (component.position.x / 3f).dp, // Translation scaling for mobile grids
+                        y = (component.position.y / 3f).dp
+                    )
+                    .background(Color.DarkGray, RoundedCornerShape(4.dp))
+                    .padding(8.dp)
+                    .pointerInput(component.id) {
+                        detectDragGestures { change, dragAmount ->
+                            change.consume()
+                            val updatedPos = Offset(
+                                component.position.x + dragAmount.x,
+                                component.position.y + dragAmount.y
                             )
-                            isLoadingAi = false
-                        }
-                    },
-                    onDismiss = { showFaultsAiDialog = false }
-                )
-            }
-
-            // Component Configuration Dialog
-            editingElement?.let { target ->
-                ComponentPropertiesDialog(
-                    element = target,
-                    allElements = elements,
-                    onSave = { updated ->
-                        elements = elements.map { if (it.id == updated.id) updated else it }
-                        editingElement = null
-                    },
-                    onDismiss = { editingElement = null }
-                )
-            }
-
-            // Clear Confirmation Dialog
-            if (showClearConfirmDialog) {
-                AlertDialog(
-                    onDismissRequest = { showClearConfirmDialog = false },
-                    containerColor = CadSurface,
-                    title = { Text("Clear Canvas?", color = TextPrimary) },
-                    text = { Text("All components and wiring will be removed.", color = TextSecondary) },
-                    confirmButton = {
-                        Button(
-                            onClick = {
-                                elements = emptyList<CircuitElement>()
-                                wires = emptyList<Wire>()
-                                selectedElementId = null
-                                showClearConfirmDialog = false
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = IndustrialStopRed)
-                        ) {
-                            Text("Clear All")
-                        }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = { showClearConfirmDialog = false }) {
-                            Text("Cancel", color = TextMuted)
+                            onComponentMoved(index, updatedPos)
                         }
                     }
-                )
+            ) {
+                Text(component.name, color = Color.White, fontSize = 11.sp)
             }
         }
     }
